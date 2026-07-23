@@ -1,0 +1,57 @@
+
+{
+  "name": "matter-echonet-bridge",
+  "version": "1.0.0",
+  "description": "ECHONET Lite ↔ Matter bridge — exposes ECHONET Lite devices (air conditioner, light, blind, temperature sensor, door lock) as Matter accessories",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/bridge.js",
+  "keywords": [
+    "echonet",
+    "echonet-lite",
+    "matter",
+    "matter-protocol",
+    "smart-home",
+    "smarthome",
+    "iot",
+    "bridge",
+    "homekit",
+    "alexa",
+    "google-home",
+    "air-conditioner",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/reo-g/matter-echonet-bridge"
+  },
+  "bugs": {
+    "url": "https://github.com/reo-g/matter-echonet-bridge/issues"
+  },
+  "homepage": "https://github.com/reo-g/matter-echonet-bridge#readme",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --enable-source-maps dist/bridge.js",
+    "start:quiet": "node --enable-source-maps dist/bridge.js --quiet",
+    "start:emulator": "node --enable-source-maps dist/bridge.js --quiet --allow-self --el-port 3611",
+    "dev": "npx tsx src/bridge.ts",
+    "dev:quiet": "npx tsx src/bridge.ts --quiet",
+    "test": "npm run build && node --import tsx --test test/e2e.test.ts",
+    "setup:elemu": "bash test/setup-elemu.sh",
+    "clean": "rm -rf dist .device-node .matter-echonet-bridge test/.tmp",
+    "reset": "rm -rf .matter-echonet-bridge && npm start"
+  },
+  "dependencies": {
+    "@matter/main": "^0.16.0",
+    "@matter/nodejs": "^0.16.0",
+    "echonet-lite": "^2.16.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.0",
+    "tsx": "^4.0.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}

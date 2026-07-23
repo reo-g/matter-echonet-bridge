@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.matter-echonet-bridge/
+.device-node/
+.matter/
+*.env
+.DS_Store
+# E2E テスト成果物
+test/.elemu/
+test/.tmp/
