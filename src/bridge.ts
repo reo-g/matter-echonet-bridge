@@ -142,6 +142,12 @@ interface AirconState {
   reachable: boolean;
   lastSeen: number;         // timestamp
   matterEndpoint?: Endpoint;
+  // syncToMatter() が最後に Matter へ書いたセットポイント (0.01℃ 単位)。
+  // 同じ値の $Changed は自分が起こしたエコーなので EL へ書き戻さない。
+  // Auto では暖房側にデッドバンドぶん低い派生値を書くため、
+  // 「設定温度と一致するか」だけでは判別できずこの記録が要る。
+  pushedCoolingSetpoint?: number;
+  pushedHeatingSetpoint?: number;
 }
 
 /** 照明デバイス状態 */
@@ -381,9 +387,11 @@ function elBrightnessToMatter(level: number): number {
   return Math.max(1, Math.round(level * 254 / 100));
 }
 
-/** Matter LevelControl currentLevel (1-254) → EL 照度レベル (0-100) */
+/** Matter LevelControl currentLevel (1-254) → EL 照度レベル (1-100) */
 function matterToElBrightness(level: number): number {
-  return Math.min(100, Math.round(level * 100 / 254));
+  // EL 0xB0 の有効範囲は 1-100%。level=1 は四捨五入で 0% になるが 0x00 は
+  // 仕様外 (SNA を返す機器がある) なので 1% に丸め上げる
+  return Math.min(100, Math.max(1, Math.round(level * 100 / 254)));
 }
 
 /** EL 照度レベル (0-100) → EDT hex (1バイト) */
@@ -863,6 +871,10 @@ class AirconManager {
 
     // SystemMode 変更 (ON/OFF + 運転モード)
     ep.events.thermostat.systemMode$Changed.on(async (newMode: Thermostat.SystemMode) => {
+      // syncToMatter() 起因の変化は書き戻さない。ここでガードしないと EL の状変を
+      // 反映するたびに EL へ SetC を投げ返し、さらに beginSuppress で後続の状変を
+      // 取りこぼす (電源 ON の直後に届く運転モード通知が無視される等)
+      if (newMode === elModeToMatterMode(dev.mode, dev.power)) return;
       logger.notice(`[→EL] SystemMode changed to ${newMode}`);
       this.beginSuppress(key);
       const { power, elMode } = matterModeToEl(newMode);
@@ -907,13 +919,20 @@ class AirconManager {
         }
       }
       if (Object.keys(setpointUpdates).length > 0) {
+        dev.pushedCoolingSetpoint = setpointUpdates.occupiedCoolingSetpoint;
+        dev.pushedHeatingSetpoint = setpointUpdates.occupiedHeatingSetpoint;
         try { (ep as any).set({ thermostat: setpointUpdates }); } catch (_) {}
       }
     });
 
     // 冷房設定温度変更
     ep.events.thermostat.occupiedCoolingSetpoint$Changed.on(async (newVal: number) => {
+      // syncToMatter() 起因の変化は書き戻さない。特に Auto では暖房側に
+      // (設定温度 - デッドバンド) を書くため、ガードが無いと EL の設定温度が
+      // 状変のたびに 1℃ ずつ下がり続ける
+      if (newVal === dev.pushedCoolingSetpoint) return;
       const celsius = matterToCelsius(newVal);
+      if (Math.round(celsius) === Math.round(dev.targetTemp)) return;
       logger.notice(`[→EL] CoolingSetpoint → ${celsius}℃`);
       this.beginSuppress(key);
       this.elClient.setProperty(
@@ -926,7 +945,9 @@ class AirconManager {
 
     // 暖房設定温度変更
     ep.events.thermostat.occupiedHeatingSetpoint$Changed.on(async (newVal: number) => {
+      if (newVal === dev.pushedHeatingSetpoint) return; // 上記と同じ理由
       const celsius = matterToCelsius(newVal);
+      if (Math.round(celsius) === Math.round(dev.targetTemp)) return;
       logger.notice(`[→EL] HeatingSetpoint → ${celsius}℃`);
       this.beginSuppress(key);
       this.elClient.setProperty(
@@ -981,6 +1002,8 @@ class AirconManager {
           break;
       }
 
+      dev.pushedCoolingSetpoint = updates.occupiedCoolingSetpoint;
+      dev.pushedHeatingSetpoint = updates.occupiedHeatingSetpoint;
       (ep as any).set({ thermostat: updates });
 
       logger.debug(`[EL→Matter] Synced: mode=${matterMode}, ` +
@@ -1100,7 +1123,8 @@ class LightManager {
     let brightnessChanged = false;
     let colorChanged = false;
 
-    if (powerEdt !== undefined) {
+    // EDT が空 (PDC=0) の応答は状態を持たないので無視する (Get_SNA の未対応 EPC 等)
+    if (powerEdt !== undefined && powerEdt !== "") {
       const newPower = powerEdt === "30";
       if (dev.power !== newPower) {
         dev.power = newPower;
@@ -1453,6 +1477,12 @@ class BlindManager {
         windowCovering: {
           currentPositionLiftPercent100ths: pos,
           currentPositionLiftPercentage: dev.isOpen ? 0 : 100,
+          // 目標位置も追従させる。ここを更新しないと EL 側で開閉されたあと
+          // Matter の目標値が古いままになり、コントローラから「その位置」を
+          // 指示しても値が変化せず (= イベントが飛ばず) 無反応になる。
+          // dev.isOpen は更新済みなので、この書き込みで目標値ハンドラが
+          // 発火しても shouldOpen === dev.isOpen で早期 return する。
+          targetPositionLiftPercent100ths: pos,
         },
       });
     } catch (e) {
@@ -2203,7 +2233,7 @@ class MonoLightManager {
       this.elClient.requestNotification(ip, seoj);
     }
 
-    if (powerEdt !== undefined) {
+    if (powerEdt !== undefined && powerEdt !== "") { // 空 EDT は状態ではない
       const newPower = powerEdt === "30";
       if (dev.power !== newPower) {
         dev.power = newPower;
@@ -2830,6 +2860,26 @@ async function main() {
   // 落とさないよう、handlePacket の Promise は必ずここで捕捉する
   await elClient.initialize((rinfo, els) => {
     const classCode = els.SEOJ.substring(0, 4).toLowerCase();
+
+    // Set_Res(0x71) / SetC_SNA(0x51) は「書き込みの結果」であって状態通知ではない。
+    // 成功した EPC は PDC=0 で返るため EDT が空文字になり、これを状態値として
+    // 取り込むと 0x80="" を「電源OFF」と誤読してしまう (点灯直後に消灯へ戻る)。
+    if (els.ESV === ESV.SET_RES || els.ESV === ESV.SETC_SNA) {
+      if (els.ESV === ESV.SETC_SNA) {
+        logger.warn(`SetC rejected (SNA) by ${rinfo.address}/${els.SEOJ}: ${JSON.stringify(els.DETAILs)}`);
+      }
+      return;
+    }
+
+    // PDC=0 (EDT が空) のプロパティは「値なし」を意味する。Get_SNA の未対応 EPC などで
+    // 現れ、値として扱うと既存の測定値を null で上書きしたり ("" を 0x30 でない = OFF と
+    // 誤読するなど) 状態が壊れるため、ディスパッチ前に取り除く。
+    if (els.DETAILs) {
+      for (const [epc, edt] of Object.entries(els.DETAILs)) {
+        if (edt === "") delete (els.DETAILs as Record<string, string>)[epc];
+      }
+    }
+
     const dispatch = async (): Promise<void> => {
       switch (classCode) {
         case "0130": await airconManager.handlePacket(rinfo, els); break;
